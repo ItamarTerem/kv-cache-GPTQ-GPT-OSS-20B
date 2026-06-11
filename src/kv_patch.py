@@ -174,13 +174,14 @@ class _FunctionalRoPE(nn.Module):
             sin = emb.sin()[None, None, :, :]
         else:
             # Half-split convention (GPT-OSS):
-            # apply_rotary_pos_emb indexes cos/sin internally via position_ids:
-            #   cos = cos[position_ids].unsqueeze(1)  → [B, 1, S, head_dim//2]
-            # So we must return raw 2D [S, head_dim//2] — NOT [1, 1, S, head_dim//2].
-            # Returning [1, 1, S, D//2] would make cos[position_ids] produce
-            # a 5D tensor ([B, S, 1, S, D//2]) and break the attention matmul.
-            cos = freqs.cos()                           # [S, head_dim//2]
-            sin = freqs.sin()                           # [S, head_dim//2]
+            # apply_rotary_pos_emb does:  cos = cos.unsqueeze(unsqueeze_dim=1)
+            # So it expects cos/sin shaped [B, S, head_dim//2] →
+            # after unsqueeze(1) → [B, 1, S, head_dim//2], which broadcasts
+            # correctly with q/k shaped [B, H, S, head_dim//2].
+            # position_ids is NOT used by GPT-OSS's apply_rotary_pos_emb.
+            # We return [1, S, head_dim//2] (batch dim=1 broadcasts to B).
+            cos = freqs.cos().unsqueeze(0)              # [1, S, head_dim//2]
+            sin = freqs.sin().unsqueeze(0)              # [1, S, head_dim//2]
 
         return cos.to(ref.dtype), sin.to(ref.dtype)
 
@@ -495,17 +496,27 @@ def _patch_attention_forward(
         S_total = S_cache + S_q
 
         # ── Step 4: Compute cos/sin for full context length ───────────────────
-        # _rotary_emb is resolved once at patch time via _resolve_rotary_emb().
-        # We must pass S_total (not just S_q) so that indices for all cached
-        # positions are available when we apply RoPE to the reconstructed K.
-        # _get_cos_sin tries multiple calling conventions automatically.
-        cos, sin = _get_cos_sin(_rotary_emb, v, S_total, position_ids)
+        # Build ONE table for S_total positions, then slice for Q and K separately.
+        #
+        # Why separate slices?
+        #   GPT-OSS's apply_rotary_pos_emb ignores position_ids — it just does
+        #   cos.unsqueeze(1) and multiplies. So cos/sin must have EXACTLY the right
+        #   sequence length or broadcasting will silently expand the wrong dim.
+        #
+        #   At decode time S_q=1 but S_total=S_cache+1. If we pass the full
+        #   [1, S_total, D//2] table to Q's RoPE call, the broadcast expands Q's
+        #   sequence dim from 1 to S_total — wrong.
+        #
+        #   Solution: slice cos_q = cos[:, -S_q:, :] (the last S_q entries,
+        #   which are the actual positions for the current tokens), and use the
+        #   full cos for K.
+        cos_full, sin_full = _get_cos_sin(_rotary_emb, v, S_total, position_ids)
+        # cos_full: [1, S_total, D//2]  — full table for positions 0..S_total-1
+        cos_q = cos_full[:, -S_q:, :]   # [1, S_q, D//2] — current token positions
+        sin_q = sin_full[:, -S_q:, :]
 
         # ── Step 5: Apply RoPE to Q (current token positions only) ───────────
-        # position_ids here is [B, S_q] — the positions of the new tokens.
-        # We call apply_rotary_pos_emb with Q twice and discard the second
-        # output (there is no pre-cache K to rotate at this stage).
-        q_roped, _ = _apply_rope(q, q, cos, sin, position_ids)
+        q_roped, _ = _apply_rope(q, q, cos_q, sin_q, position_ids)
         # q_roped: [B, H, S_q, D]
 
         # ── Step 6: Cache V, get full accumulated V ───────────────────────────
@@ -537,7 +548,7 @@ def _patch_attention_forward(
             .unsqueeze(0)
             .expand(B, -1)   # [B, S_total]
         )
-        _, K_acc = _apply_rope(K_pre_acc, K_pre_acc, cos, sin, full_pos_ids)
+        _, K_acc = _apply_rope(K_pre_acc, K_pre_acc, cos_full, sin_full, full_pos_ids)
         # K_acc: [B, G, S_total, D]
         # (We pass K_pre_acc as both q and k and discard the first output.)
 
@@ -573,7 +584,9 @@ def _patch_attention_forward(
         )
         attn_output = attn.o_proj(attn_output)   # [B, S_q, d_model]
 
-        return attn_output, None, cache
+        # GptOssDecoderLayer unpacks exactly 2 values: hidden_states, _
+        # Return (attn_output, cache) — cache goes into the ignored second slot.
+        return attn_output, cache
 
     attn.forward = patched_forward
 
