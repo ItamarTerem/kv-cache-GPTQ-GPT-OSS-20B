@@ -1,0 +1,31 @@
+# requirements.txt — gpt-oss-20b-BF16 V-only KV cache project
+#
+# PyTorch is intentionally NOT listed here.
+# setup_runtime.sh installs it separately with the correct CUDA wheel.
+#
+# Install:
+#   bash scripts/setup_runtime.sh   # sets up venv + PyTorch + these deps
+
+# ── HuggingFace stack ─────────────────────────────────────────────────────────
+
+# Pin transformers to a range that includes the GQA modeling code used by
+# gpt-oss. Upper bound avoids potential breaking changes in future majors.
+transformers>=4.40.0,<5.0.0
+
+# Fast model weight downloads (set HF_HUB_ENABLE_HF_TRANSFER=1 to activate).
+# Installed automatically but listed explicitly so the env var is meaningful.
+huggingface_hub>=0.22.0
+hf_transfer>=0.1.6
+
+# Tokenizer backend
+tokenizers>=0.19.0
+
+# ── Numerical / utilities ─────────────────────────────────────────────────────
+
+accelerate>=0.29.0   # device_map="auto" and multi-GPU support
+safetensors>=0.4.3   # faster weight loading vs pickle
+
+# ── Optional: GPU memory profiling ───────────────────────────────────────────
+# Used by verify_kv_relation.py Test 5 (memory savings measurement).
+# Comment out if nvidia-ml-py causes install issues in your environment.
+nvidia-ml-py>=12.535.0
